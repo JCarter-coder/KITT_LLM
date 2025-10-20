@@ -14,6 +14,9 @@ from llama_cpp import Llama
 # Other better sounding libraries are available but this works offline well
 import pyttsx3
 
+# Import library to play music file
+import pygame
+
 # For multiprocessing and threading
 import multiprocessing, threading, queue, re, atexit
 
@@ -29,21 +32,16 @@ from tkmacosx import Button, CircleButton
 # GLOBAL SETTINGS -----------------------------------------
 DEFAULT_FONT = ("Helvetica", 26)
 
+DUCK_VOL, NORMAL_VOL = 0.03, 0.3
+
 # Initialize a queue to handle TTS requests
 tts_queue = queue.Queue()
-# Initialize the pyttsx3 engine
-converter_tts_engine = pyttsx3.init()
-# Set properties of our speech engine object
-# Speed percent (can go over 100)
-converter_tts_engine.setProperty('rate', 190)
-# Volume 0-1
-converter_tts_engine.setProperty('volume', 0.7)
 
-# Pick a voice to use
-# voice_id = "com.apple.speech.synthesis.voice.Alex"
-voice_id = "com.apple.voice.enhanced.en-US.Tom"
-# Set voice property with voice id
-converter_tts_engine.setProperty('voice', voice_id)
+# Initialize pygame music mixer
+pygame.mixer.init()
+pygame.mixer.music.load("resources/KnightRiderTheme.mp3")
+pygame.mixer.music.play(-1)
+pygame.mixer.music.set_volume(NORMAL_VOL)
 
 # Determine the number of CPU cores available on the system
 num_cores = multiprocessing.cpu_count()
@@ -73,7 +71,7 @@ llm = Llama(
 total_tokens_used = 0
 
 # Let's add a variable to use as a flag to let the user know 
-# if our model is still working on resonse to our prompt
+# if our model is still working on response to our prompt
 is_generating = False
 
 # Create a function to update a timer in the GUI
@@ -87,15 +85,52 @@ def update_timer(start_time):
         # Sleep for a short amount of time so our timer doesn't use too much CPU
         time.sleep(0.1)
 
+def toggle_music_volume():
+    global DUCK_VOL, NORMAL_VOL
+    current_vol = pygame.mixer.music.get_volume()
+    if current_vol > DUCK_VOL:
+        current_vol = DUCK_VOL
+    else:
+        current_vol = NORMAL_VOL
+    pygame.mixer.music.set_volume(current_vol)
+
+def restore_music_volume():
+    global NORMAL_VOL
+    pygame.mixer.music.set_volume(NORMAL_VOL)
 
 # Create the function we will use to speak
-def speak(text_to_speak):
-    # Queue the entered text to be spoken
-    converter_tts_engine.say(text_to_speak)
-    # Run the speech engine and wait until it finishes speaking
-    converter_tts_engine.runAndWait()
+def speak():
+    # Initialize the pyttsx3 engine
+    converter_tts_engine = pyttsx3.init()
+    # Set properties of our speech engine object
+    # Speed percent (can go over 100)
+    converter_tts_engine.setProperty('rate', 185)
+    # Volume 0-1
+    converter_tts_engine.setProperty('volume', 0.7)
 
+    # Pick a voice to use
+    # voice_id = "com.apple.speech.synthesis.voice.Alex"
+    voice_id = "com.apple.voice.enhanced.en-US.Tom"
+    # Set voice property with voice id
+    converter_tts_engine.setProperty('voice', voice_id)
+    # Only this thread speaks
+    while True:
+        # Get responses from the queue
+        text = tts_queue.get()
+        if text is None:
+            break
+        try: 
+            # If there is text, speak it and wait until done
+            converter_tts_engine.say(text)
+            converter_tts_engine.runAndWait()
+            print("[TTS alive?]", threading.current_thread().is_alive(), "qsize:", tts_queue.qsize())
+        except Exception as e:
+            # Log any exceptions during the TTS
+            print(f"Error in TTS engine: {e}")            
 
+# Create and start the TTS thread
+tts_thread = threading.Thread(target=speak, daemon=True)
+tts_thread.start()
 
 # Create a function to send the prompt to the model and get the response
 def send_message():
@@ -156,32 +191,47 @@ def generate_response_threaded(full_prompt):
     # IMPORTANT Multi-threading
     # We are making a timer update thread to keep our GUI responsive
     threading.Thread(target=update_timer, args=(start_time,), daemon=True).start()
+    
+    try:
+        # Now let's get the model's response
+        # THIS IS IMPORTANT
+        # This is sent to the model each time the user hits send
+        response = llm(
+            f"User: {full_prompt}\nAssistant:",
+            # We limit the response to 1024 tokens
+            # This size does not include the prompt tokens size
+            max_tokens=1024,
+            # This will stop the model from generating more text and going on and on
+            stop=["\nUser:", "\n\nUser:", "User:"],
+            # We do not want our own prompt back in the response
+            echo=False
+        )
 
-    # Now let's get the model's response
-    # THIS IS IMPORTANT
-    # This is sent to the model each time the user hits send
-    response = llm(
-        f"User: {full_prompt}\nAssistant:",
-        # We limit the response to 1024 tokens
-        # This size does not include the prompt tokens size
-        max_tokens=2048,
-        # This will stop the model from generating more text and going on and on
-        stop=["User:"],
-        # We do not want our own prompt back in the response
-        echo=False
-    )
+        # Now that we have the response we can set our flag to False
+        is_generating = False
 
-    # Now that we have the response we can set our flag to False
-    is_generating = False
+        # Let's extract the response text from the response object
+        response_text = response['choices'][0]['text'].strip()
 
-    # Let's extract the resonse text from the response object
-    response_text = response['choices'][0]['text'].strip()
+        # Queue the response text for the TTS
+        if response_text:
+            print("[EMQ]", len(response_text), "chars")
+            tts_queue.put(response_text)
 
-    # Calculate the total time taken for the response
-    final_time = time.time() - start_time
+        # Calculate the total time taken for the response
+        final_time = time.time() - start_time
 
-    # Now we need to update the GUI with the response and final time
-    root.after(0, update_gui, response_text, final_time)
+        # Now we need to update the GUI with the response and final time
+        root.after(0, update_gui, response_text, final_time)
+    
+    except Exception as e:
+        print("[LLM error]:", repr(e))
+        root.after(0, update_gui, f"(Error: {e})", 0.0)
+
+    finally:
+        # Ensure the is_generating flag is reset in case of error
+        is_generating = False
+
     # END of the function
 
     # Add the model's response to our output box
@@ -195,6 +245,7 @@ def generate_response_threaded(full_prompt):
 
 # Create a function to update the GUI after the response is done
 def update_gui(response_text, final_time):
+    global is_tts_speaking
     # Add the model's response to our output box
     chat_display.insert(tk.END, f"KITT: {response_text}\n\n")
     # Let's auto scroll to the bottom of the chat display
@@ -207,14 +258,13 @@ def update_gui(response_text, final_time):
     entry.config(state=tk.NORMAL)
     send_button.config(state=tk.NORMAL)
 
+
 # Let's create our main window
 root = tk.Tk()
 # Set the title of the window
 root.title("KITT - Knight Industries Three Thousand")
 # Set the size of the window
 root.geometry("1000x1000")
-# Make all fonts larger for better readability
-#root.configure(bg="white")
 
 # Create a function to handle closing our app gracefully
 def on_closing():
@@ -266,6 +316,10 @@ send_button.grid(row=2, column=1, padx=5, pady=10, sticky="ew")
 # Create our exit button
 exit_button = CircleButton(root, text="Exit", font=DEFAULT_FONT, bg="red", fg="white", command=on_closing)
 exit_button.grid(row=2, column=2, padx=(5,10), pady=10, sticky="ew")
+
+# Create a volume on/off button
+music_button = Button(root, text="Music (Toggle Volume)", bg="gray", fg="lightgray", font=DEFAULT_FONT, command=toggle_music_volume)
+music_button.grid(row=4, column=0, columnspan=3, pady=(0,10), sticky="ew")
 
 # Create a label to display the timer
 timer_label = tk.Label(root, text="Response time: 0.00 seconds", font=DEFAULT_FONT)
